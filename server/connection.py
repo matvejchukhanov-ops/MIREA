@@ -1,35 +1,39 @@
 """Обслуживание одного клиентского соединения.
 
-Этап 2: байты из сокета собираются в кадры по разделителю, и эхо возвращается
-покадрово. Разница с этапом 1 видна сразу: раньше два быстрых send() клиента
-отражались одним слипшимся куском, теперь — двумя отдельными сообщениями.
+Этап 3: содержимое кадра разбирается как JSON, команда ищется в диспетчере,
+результат возвращается в виде ответа с полем status. Эхо-режим закончился —
+сервер теперь понимает, что ему прислали.
 
-Разбора JSON здесь пока нет, содержимое кадра сервер не интерпретирует.
-Он появится на этапе 3.
+Цепочка на один кадр:
+    байты -> кадр -> Request -> обработчик -> результат -> кадр ответа
 """
 from __future__ import annotations
 
 import logging
 import socket
 
-from common.framing import FrameReader, FrameTooLongError, encode_frame
+from common.framing import FrameReader, FrameTooLongError
 
 from .config import ServerConfig
+from .dispatcher import Dispatcher
+from .protocol import ErrorCode, ProtocolError, error_frame, parse_request, success_frame
+from .session import Session
 
 logger = logging.getLogger("server.connection")
 
 Address = tuple[str, int]
-
-# Ответ на нарушение фрейминга. На этапе 3 станет полноценным JSON с кодом
-# ошибки, пока — простой текстовый маркер.
-FRAME_TOO_LONG_NOTICE = b"FRAME_TOO_LONG"
 
 # Пределы «вежливого» закрытия после ошибки протокола.
 DRAIN_TIMEOUT = 1.0
 DRAIN_LIMIT = 64 * 1024
 
 
-def handle_connection(sock: socket.socket, addr: Address, config: ServerConfig) -> None:
+def handle_connection(
+    sock: socket.socket,
+    addr: Address,
+    config: ServerConfig,
+    dispatcher: Dispatcher,
+) -> None:
     """Обслужить одного клиента до отключения.
 
     Вызывающая сторона отвечает за закрытие сокета — здесь только обмен.
@@ -40,11 +44,12 @@ def handle_connection(sock: socket.socket, addr: Address, config: ServerConfig) 
     # Молчащий клиент не должен занимать соединение бесконечно.
     sock.settimeout(config.idle_timeout)
 
+    session = Session(peer=peer)
     reader = FrameReader(config.max_frame_size)
     frames_total = 0
 
     try:
-        while True:
+        while not session.should_close:
             try:
                 chunk = sock.recv(config.recv_size)
             except TimeoutError:
@@ -60,8 +65,6 @@ def handle_connection(sock: socket.socket, addr: Address, config: ServerConfig) 
                 logger.info("Клиент %s закрыл соединение", peer)
                 break
 
-            logger.debug("От %s прочитано %d байт", peer, len(chunk))
-
             try:
                 frames = reader.feed(chunk)
             except FrameTooLongError as exc:
@@ -72,7 +75,11 @@ def handle_connection(sock: socket.socket, addr: Address, config: ServerConfig) 
                     peer,
                     exc.limit,
                 )
-                _try_send(sock, encode_frame(FRAME_TOO_LONG_NOTICE), peer)
+                _try_send(
+                    sock,
+                    error_frame(ErrorCode.FRAME_TOO_LONG, f"Кадр длиннее {exc.limit} байт"),
+                    peer,
+                )
                 _close_gracefully(sock, peer)
                 break
 
@@ -80,13 +87,15 @@ def handle_connection(sock: socket.socket, addr: Address, config: ServerConfig) 
             # сторону: кадров может прийти несколько, а может не прийти ни одного.
             for frame in frames:
                 frames_total += 1
-                logger.debug("Кадр от %s (%d байт): %r", peer, len(frame), frame)
+                logger.debug("Запрос от %s: %r", peer, frame)
+                response = _process_frame(frame, session, dispatcher)
+                logger.debug("Ответ для %s: %r", peer, response)
                 # sendall, а не send: send отправляет столько, сколько получилось,
                 # и остаток пришлось бы досылать вручную.
-                sock.sendall(encode_frame(frame))
-
-            if not frames:
-                logger.debug("Кадр от %s ещё не завершён, в буфере %d байт", peer, reader.pending)
+                sock.sendall(response)
+                if session.should_close:
+                    logger.info("Клиент %s завершил сеанс командой quit", peer)
+                    break
 
     except ConnectionError as exc:
         # Клиент закрыл окно или оборвал связь на полуслове — штатная ситуация,
@@ -98,7 +107,36 @@ def handle_connection(sock: socket.socket, addr: Address, config: ServerConfig) 
     except OSError as exc:
         logger.error("Ошибка сокета при работе с %s: %s", peer, exc)
     finally:
-        logger.info("Клиент отключился: %s (обработано кадров: %d)", peer, frames_total)
+        logger.info("Клиент отключился: %s (обработано запросов: %d)", peer, frames_total)
+
+
+def _process_frame(frame: bytes, session: Session, dispatcher: Dispatcher) -> bytes:
+    """Превратить кадр запроса в кадр ответа.
+
+    Функция никогда не выбрасывает исключений: любая беда должна стать
+    ответом с кодом ошибки, иначе одна кривая строка от клиента обрывает
+    соединение целиком.
+    """
+    try:
+        request = parse_request(frame)
+    except ProtocolError as exc:
+        # Разобрать не удалось, поэтому id запроса неизвестен.
+        return error_frame(exc.code, exc.message, position=exc.position)
+
+    try:
+        result = dispatcher.dispatch(request, session)
+    except ProtocolError as exc:
+        return error_frame(exc.code, exc.message, request_id=request.id, position=exc.position)
+    except Exception:
+        # Ошибка в обработчике — вина сервера, а не клиента. Клиенту уходит
+        # нейтральное сообщение, подробности с трассировкой остаются в логе:
+        # внутреннее устройство сервера наружу отдавать не следует.
+        logger.exception("Непредвиденная ошибка при обработке команды %r", request.cmd)
+        return error_frame(
+            ErrorCode.INTERNAL_ERROR, "Внутренняя ошибка сервера", request_id=request.id
+        )
+
+    return success_frame(result, request_id=request.id)
 
 
 def _try_send(sock: socket.socket, data: bytes, peer: str) -> None:

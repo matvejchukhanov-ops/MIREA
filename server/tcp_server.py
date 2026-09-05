@@ -1,9 +1,9 @@
 """Слушающий сокет и цикл приёма подключений.
 
-Этап 1: клиенты обслуживаются по очереди, в одном потоке. Это сделано
-намеренно — так видно, ради чего на этапе 7 появятся потоки: пока сервер
-разговаривает с одним клиентом, он не возвращается к accept(), и второй
-клиент ждёт в очереди.
+Клиенты пока обслуживаются по очереди, в одном потоке. Это сделано намеренно —
+так видно, ради чего на этапе 7 появятся потоки: пока сервер разговаривает
+с одним клиентом, он не возвращается к accept(), и второй клиент ждёт
+в очереди.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import socket
 
 from .config import ServerConfig
 from .connection import handle_connection
+from .handlers import build_dispatcher
 
 logger = logging.getLogger("server.tcp")
 
@@ -28,6 +29,9 @@ class TCPServer:
         self._config = config
         self._socket: socket.socket | None = None
         self._running = False
+        # Реестр команд собирается один раз при запуске: после сборки он
+        # только читается, поэтому его безопасно делить между соединениями.
+        self._dispatcher = build_dispatcher()
 
     def serve_forever(self) -> None:
         """Принимать подключения, пока не остановят."""
@@ -36,6 +40,7 @@ class TCPServer:
 
         host, port = self._config.address
         logger.info("Сервер слушает %s:%d", host, port)
+        logger.info("Доступные команды: %s", ", ".join(self._dispatcher.commands))
         logger.info("Остановка — Ctrl+C")
 
         try:
@@ -53,7 +58,7 @@ class TCPServer:
                 # Контекстный менеджер закрывает сокет клиента в любом случае,
                 # включая исключение внутри обработчика.
                 with client_socket:
-                    handle_connection(client_socket, addr, self._config)
+                    handle_connection(client_socket, addr, self._config, self._dispatcher)
 
         except KeyboardInterrupt:
             logger.info("Получен сигнал прерывания")
