@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from common.framing import MAX_FRAME_SIZE as DEFAULT_MAX_FRAME_SIZE
+
 # --- Умолчания ---
 
 DEFAULT_HOST = "127.0.0.1"
@@ -45,6 +47,7 @@ class ServerConfig:
     port: int = DEFAULT_PORT
     backlog: int = DEFAULT_BACKLOG
     recv_size: int = DEFAULT_RECV_SIZE
+    max_frame_size: int = DEFAULT_MAX_FRAME_SIZE
     idle_timeout: float = DEFAULT_IDLE_TIMEOUT
     log_level: str = DEFAULT_LOG_LEVEL
 
@@ -59,6 +62,8 @@ class ServerConfig:
             raise ConfigError("Размер очереди подключений должен быть не меньше 1")
         if self.recv_size < 1:
             raise ConfigError("Размер буфера чтения должен быть не меньше 1")
+        if self.max_frame_size < 2:
+            raise ConfigError("Предельный размер кадра должен вмещать байт и разделитель")
         if self.idle_timeout <= 0:
             raise ConfigError("Таймаут бездействия должен быть положительным")
 
@@ -80,6 +85,7 @@ class ServerConfig:
             port=_env_int("CALC_PORT", DEFAULT_PORT),
             backlog=_env_int("CALC_BACKLOG", DEFAULT_BACKLOG),
             recv_size=_env_int("CALC_RECV_SIZE", DEFAULT_RECV_SIZE),
+            max_frame_size=_env_int("CALC_MAX_FRAME_SIZE", DEFAULT_MAX_FRAME_SIZE),
             idle_timeout=_env_float("CALC_IDLE_TIMEOUT", DEFAULT_IDLE_TIMEOUT),
             log_level=os.environ.get("CALC_LOG_LEVEL", DEFAULT_LOG_LEVEL).upper(),
         )
