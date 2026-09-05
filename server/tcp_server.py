@@ -1,17 +1,23 @@
-"""Слушающий сокет и цикл приёма подключений.
+"""Слушающий сокет, цикл приёма подключений и запуск потоков.
 
-Клиенты пока обслуживаются по очереди, в одном потоке. Это сделано намеренно —
-так видно, ради чего на этапе 7 появятся потоки: пока сервер разговаривает
-с одним клиентом, он не возвращается к accept(), и второй клиент ждёт
-в очереди.
+Этап 7: каждому клиенту выделяется отдельный поток.
+
+Зачем это нужно, видно из устройства сокетов: и accept(), и recv() —
+блокирующие вызовы. Пока сервер в одном потоке разговаривает с клиентом,
+он не возвращается к accept(), и следующий клиент ждёт в очереди
+неопределённо долго.
+
+Главный поток теперь занимается только приёмом подключений, а обмен идёт
+в отдельных потоках.
 """
 from __future__ import annotations
 
 import logging
 import socket
+import threading
 
 from .config import ServerConfig
-from .connection import handle_connection
+from .connection import handle_connection, refuse_connection
 from .handlers import build_dispatcher
 
 logger = logging.getLogger("server.tcp")
@@ -21,17 +27,32 @@ logger = logging.getLogger("server.tcp")
 # не подключится очередной клиент.
 ACCEPT_POLL_INTERVAL = 0.5
 
+# Сколько ждать завершения рабочих потоков при остановке.
+SHUTDOWN_JOIN_TIMEOUT = 2.0
+
 
 class TCPServer:
-    """TCP-сервер: принимает подключения и передаёт их обработчику."""
+    """TCP-сервер: принимает подключения и обслуживает их в потоках."""
 
     def __init__(self, config: ServerConfig) -> None:
         self._config = config
         self._socket: socket.socket | None = None
         self._running = False
         # Реестр команд собирается один раз при запуске: после сборки он
-        # только читается, поэтому его безопасно делить между соединениями.
+        # только читается, поэтому его безопасно делить между потоками.
         self._dispatcher = build_dispatcher()
+
+        # Единственное, что потоки разделяют: счётчик активных соединений.
+        # Операция «прочитать, прибавить, записать» не атомарна, поэтому
+        # без блокировки два потока могут затереть изменения друг друга.
+        self._lock = threading.Lock()
+        self._active = 0
+        self._threads: set[threading.Thread] = set()
+
+    @property
+    def active_connections(self) -> int:
+        with self._lock:
+            return self._active
 
     def serve_forever(self) -> None:
         """Принимать подключения, пока не остановят."""
@@ -41,6 +62,7 @@ class TCPServer:
         host, port = self._config.address
         logger.info("Сервер слушает %s:%d", host, port)
         logger.info("Доступные команды: %s", ", ".join(self._dispatcher.commands))
+        logger.info("Предел одновременных клиентов: %d", self._config.max_connections)
         logger.info("Остановка — Ctrl+C")
 
         try:
@@ -49,16 +71,14 @@ class TCPServer:
                     client_socket, addr = self._socket.accept()
                 except TimeoutError:
                     # Ожидаемое срабатывание таймаута опроса, не ошибка.
+                    self._forget_finished_threads()
                     continue
                 except OSError:
                     if not self._running:
                         break
                     raise
 
-                # Контекстный менеджер закрывает сокет клиента в любом случае,
-                # включая исключение внутри обработчика.
-                with client_socket:
-                    handle_connection(client_socket, addr, self._config, self._dispatcher)
+                self._start_worker(client_socket, addr)
 
         except KeyboardInterrupt:
             logger.info("Получен сигнал прерывания")
@@ -71,7 +91,66 @@ class TCPServer:
         if self._socket is not None:
             self._socket.close()
             self._socket = None
-            logger.info("Сервер остановлен")
+
+        # Потоки фоновые и умрут вместе с процессом, но дать им немного
+        # времени на корректное завершение дешевле, чем обрывать обмен
+        # посреди отправки ответа.
+        for thread in list(self._threads):
+            thread.join(timeout=SHUTDOWN_JOIN_TIMEOUT)
+        self._threads.clear()
+
+        logger.info("Сервер остановлен")
+
+    # --- Внутреннее ---
+
+    def _start_worker(self, client_socket: socket.socket, addr: tuple[str, int]) -> None:
+        """Выделить клиенту поток или вежливо отказать."""
+        peer = f"{addr[0]}:{addr[1]}"
+
+        with self._lock:
+            if self._active >= self._config.max_connections:
+                # Отказ обрабатывается прямо здесь, в главном потоке: он
+                # укладывается в одну отправку и не стоит нового потока.
+                logger.warning(
+                    "Достигнут предел подключений (%d), отказываю %s",
+                    self._config.max_connections,
+                    peer,
+                )
+                refuse_connection(client_socket, peer, self._config.max_connections)
+                return
+            self._active += 1
+
+        thread = threading.Thread(
+            target=self._serve_client,
+            args=(client_socket, addr, peer),
+            name=f"client-{peer}",
+            # Фоновый: аварийная остановка сервера не должна подвисать
+            # в ожидании клиентов, которые могут молчать сколько угодно.
+            daemon=True,
+        )
+        self._threads.add(thread)
+        thread.start()
+
+    def _serve_client(
+        self, client_socket: socket.socket, addr: tuple[str, int], peer: str
+    ) -> None:
+        """Тело рабочего потока."""
+        try:
+            # Контекстный менеджер закрывает сокет в любом случае,
+            # включая исключение внутри обработчика.
+            with client_socket:
+                handle_connection(client_socket, addr, self._config, self._dispatcher)
+        except Exception:
+            # Сбой в одном потоке завершает одно соединение. Сервер и
+            # остальные клиенты продолжают работать.
+            logger.exception("Поток обслуживания %s завершился с ошибкой", peer)
+        finally:
+            with self._lock:
+                self._active -= 1
+
+    def _forget_finished_threads(self) -> None:
+        """Убрать из набора уже завершившиеся потоки."""
+        self._threads = {thread for thread in self._threads if thread.is_alive()}
 
     def _create_listening_socket(self) -> socket.socket:
         """Создать, настроить и перевести в режим прослушивания."""

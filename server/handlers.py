@@ -6,15 +6,39 @@
 
 Об ошибке сообщается исключением ProtocolError с кодом: превращать его
 в ответ будет вызывающая сторона.
-
-Этап 3: ping и quit. Команды calc и history появятся на этапах 4 и 6 —
-до тех пор сервер честно отвечает на них UNKNOWN_COMMAND.
 """
 from __future__ import annotations
 
+from typing import Any
+
+from .calc import (
+    CalcError,
+    DepthExceededError,
+    DivisionByZeroError,
+    ExpressionSyntaxError,
+    ExpressionTooLongError,
+    NumberTooLargeError,
+    UnknownCharError,
+    calculate,
+)
 from .dispatcher import Dispatcher
-from .protocol import Request
-from .session import Session
+from .protocol import ErrorCode, ProtocolError, Request
+from .session import HISTORY_CAPACITY, Session
+
+DEFAULT_HISTORY_LIMIT = 10
+
+# Сопоставление ошибок вычислительного ядра с кодами протокола.
+#
+# Таблица живёт здесь, а не в calc/, чтобы ядро оставалось независимым от
+# протокола: «строка → число» должно работать и без сервера.
+ERROR_CODES: dict[type[CalcError], ErrorCode] = {
+    ExpressionTooLongError: ErrorCode.EXPR_TOO_LONG,
+    UnknownCharError: ErrorCode.UNKNOWN_CHAR,
+    ExpressionSyntaxError: ErrorCode.SYNTAX_ERROR,
+    DepthExceededError: ErrorCode.DEPTH_EXCEEDED,
+    DivisionByZeroError: ErrorCode.DIV_BY_ZERO,
+    NumberTooLargeError: ErrorCode.NUMBER_TOO_LARGE,
+}
 
 
 def handle_ping(request: Request, session: Session) -> str:
@@ -29,6 +53,29 @@ def handle_quit(request: Request, session: Session) -> str:
     return "bye"
 
 
+def handle_calc(request: Request, session: Session) -> int | float:
+    """Вычислить выражение."""
+    expression = request.require_str("expr")
+
+    try:
+        result = calculate(expression)
+    except CalcError as exc:
+        raise ProtocolError(
+            _code_for(exc), exc.message, position=exc.position
+        ) from exc
+
+    session.remember(expression, result)
+    return result
+
+
+def handle_history(request: Request, session: Session) -> list[dict[str, Any]]:
+    """Последние успешные вычисления в этом соединении."""
+    limit = request.optional_int(
+        "limit", DEFAULT_HISTORY_LIMIT, minimum=1, maximum=HISTORY_CAPACITY
+    )
+    return session.recent(limit)
+
+
 def build_dispatcher() -> Dispatcher:
     """Собрать реестр команд.
 
@@ -37,5 +84,17 @@ def build_dispatcher() -> Dispatcher:
     """
     dispatcher = Dispatcher()
     dispatcher.register("ping", handle_ping)
+    dispatcher.register("calc", handle_calc)
+    dispatcher.register("history", handle_history)
     dispatcher.register("quit", handle_quit)
     return dispatcher
+
+
+def _code_for(error: CalcError) -> ErrorCode:
+    """Подобрать код протокола для ошибки вычисления."""
+    for error_type, code in ERROR_CODES.items():
+        if isinstance(error, error_type):
+            return code
+    # Новый тип ошибки, не внесённый в таблицу. Отдать наружу нейтральный
+    # код безопаснее, чем упасть: клиент получит ответ, а не разрыв.
+    return ErrorCode.INTERNAL_ERROR

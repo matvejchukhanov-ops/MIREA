@@ -10,7 +10,9 @@ import logging
 import sys
 from pathlib import Path
 
-LOG_FORMAT = "%(asctime)s  %(levelname)-8s  %(name)-18s  %(message)s"
+# Имя потока в каждой строке: с появлением потока на клиента без него
+# невозможно понять, к какому соединению относится запись.
+LOG_FORMAT = "%(asctime)s  %(levelname)-8s  %(threadName)-22s  %(message)s"
 DATE_FORMAT = "%H:%M:%S"
 
 

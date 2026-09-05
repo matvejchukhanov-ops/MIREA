@@ -81,7 +81,7 @@ def format_response(data: Any, source_line: str) -> str:
         if isinstance(result, list):
             if not result:
                 return "(пусто)"
-            return "\n".join(f"  {item}" for item in result)
+            return "\n".join(_format_history_item(item) for item in result)
         return str(result)
 
     if status == "error":
@@ -95,6 +95,14 @@ def format_response(data: Any, source_line: str) -> str:
     # Поле status обязано быть всегда — его отсутствие означает,
     # что мы разговариваем не с тем сервером.
     return f"Ответ без поля status: {data!r}"
+
+
+def _format_history_item(item: Any) -> str:
+    """Одна запись истории в виде «выражение = результат»."""
+    if isinstance(item, dict) and "expr" in item and "result" in item:
+        return f"  {item['expr']} = {item['result']}"
+    # Сервер прислал что-то незнакомое — показать как есть, но не падать.
+    return f"  {item}"
 
 
 def run_session(connection: ServerConnection) -> None:

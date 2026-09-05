@@ -34,6 +34,7 @@ class ErrorCode(StrEnum):
     NUMBER_TOO_LARGE = "NUMBER_TOO_LARGE"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     FRAME_TOO_LONG = "FRAME_TOO_LONG"
+    SERVER_BUSY = "SERVER_BUSY"
 
 
 class ProtocolError(Exception):

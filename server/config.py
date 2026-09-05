@@ -28,6 +28,11 @@ DEFAULT_RECV_SIZE = 4096
 # соединение. Без таймаута забытое соединение занимает ресурсы бесконечно.
 DEFAULT_IDLE_TIMEOUT = 300.0
 
+# Сколько клиентов обслуживать одновременно. Каждый занимает поток, а поток
+# стоит памяти под стек: без предела клиент, открывающий соединения пачками,
+# исчерпает ресурсы машины.
+DEFAULT_MAX_CONNECTIONS = 64
+
 DEFAULT_LOG_LEVEL = "INFO"
 
 _MIN_PORT = 1
@@ -49,6 +54,7 @@ class ServerConfig:
     recv_size: int = DEFAULT_RECV_SIZE
     max_frame_size: int = DEFAULT_MAX_FRAME_SIZE
     idle_timeout: float = DEFAULT_IDLE_TIMEOUT
+    max_connections: int = DEFAULT_MAX_CONNECTIONS
     log_level: str = DEFAULT_LOG_LEVEL
 
     def __post_init__(self) -> None:
@@ -66,6 +72,8 @@ class ServerConfig:
             raise ConfigError("Предельный размер кадра должен вмещать байт и разделитель")
         if self.idle_timeout <= 0:
             raise ConfigError("Таймаут бездействия должен быть положительным")
+        if self.max_connections < 1:
+            raise ConfigError("Число одновременных подключений должно быть не меньше 1")
 
     @property
     def address(self) -> tuple[str, int]:
@@ -87,6 +95,7 @@ class ServerConfig:
             recv_size=_env_int("CALC_RECV_SIZE", DEFAULT_RECV_SIZE),
             max_frame_size=_env_int("CALC_MAX_FRAME_SIZE", DEFAULT_MAX_FRAME_SIZE),
             idle_timeout=_env_float("CALC_IDLE_TIMEOUT", DEFAULT_IDLE_TIMEOUT),
+            max_connections=_env_int("CALC_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS),
             log_level=os.environ.get("CALC_LOG_LEVEL", DEFAULT_LOG_LEVEL).upper(),
         )
 
